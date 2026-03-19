@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""
+Claude Explorer (ce) — Interactive navigator for Claude Code context objects.
+
+Copyright (c) 2025. Released under the MIT License.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software, to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, subject to the
+following conditions:
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+This tool is not affiliated with, endorsed by, or supported by Anthropic, PBC.
+It reads local Claude Code configuration files in a read-only manner.
+Use at your own risk. No guarantee is made regarding correctness, completeness,
+or fitness for any particular purpose.
+
+Provides menu-driven access to:
+- CLAUDE.md project instructions
+- Memory files (project memory)
+- Settings & permissions
+- Hooks configuration
+- Slash commands
+- MCP plugins
+- Plans
+
+Design modeled after tm (Table Maintenance) utility.
+"""
+
+import json
+import os
+import sys
+import re
+from pathlib import Path
+from datetime import datetime
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+CLAUDE_HOME = Path.home() / ".claude"
+CLAUDE_COMMANDS_USER = CLAUDE_HOME / "commands"
+CLAUDE_SETTINGS = CLAUDE_HOME / "settings.json"
+CLAUDE_PLUGINS = CLAUDE_HOME / "plugins"
+CLAUDE_PLANS = CLAUDE_HOME / "plans"
+CLAUDE_SESSIONS = CLAUDE_HOME / "sessions"
+
+
+def get_project_root():
+    """Walk up from cwd to find the nearest git root or dir with CLAUDE.md."""
+    cwd = Path.cwd()
+    # Try git root first
+    d = cwd
+    while d != d.parent:
+        if (d / ".git").exists():
+            return d
+        d = d.parent
+    # Fallback: look for CLAUDE.md
+    d = cwd
+    while d != d.parent:
+        if (d / "CLAUDE.md").exists():
+            return d
+        d = d.parent
+    return cwd
+
+
+def get_memory_dirs():
+    """Find ALL Claude memory directories for the current project.
+
+    Claude slugifies the project path (/ → -), but the project dir name
+    may have changed (e.g. scoring_app vs scoring-app), so we match all
+    slug variants that share the same parent path prefix.
+    """
+    project_root = get_project_root()
+    projects_dir = CLAUDE_HOME / "projects"
+    if not projects_dir.exists():
+        return []
+
+    # Normalize: replace / and _ with - for fuzzy matching
+    normalized = str(project_root).replace("/", "-").replace("_", "-").lower()
+    # Also try exact slug
+    exact_slug = str(project_root).replace("/", "-")
+
+    dirs = []
+    for d in sorted(projects_dir.iterdir()):
+        if not d.is_dir() or not (d / "memory").exists():
+            continue
+        candidate = d.name.replace("_", "-").lower()
+        if candidate == normalized or d.name == exact_slug:
+            dirs.append(d / "memory")
+
+    return dirs
+
+
+def get_memory_dir():
+    """Return the primary (most recently modified) memory directory."""
+    dirs = get_memory_dirs()
+    if not dirs:
+        # Return expected path even if it doesn't exist
+        project_root = get_project_root()
+        slug = str(project_root).replace("/", "-")
+        return CLAUDE_HOME / "projects" / slug / "memory"
+    if len(dirs) == 1:
+        return dirs[0]
+    # Return the one modified most recently
+    return max(dirs, key=lambda d: d.stat().st_mtime)
+
+
+def get_project_commands_dir():
+    """Find project-level .claude/commands/ directory."""
+    project_root = get_project_root()
+    return project_root / ".claude" / "commands"
+
+
+# ============================================================================
+# DISPLAY HELPERS
+# ============================================================================
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def header(title, width=70):
+    """Print a section header."""
+    print(f"\n{BOLD}{'=' * width}")
+    print(f"{title}")
+    print(f"{'=' * width}{RESET}")
+
+
+def subheader(title, width=70):
+    """Print a sub-section header."""
+    print(f"\n{BOLD}{'-' * width}")
+    print(f"{title}")
+    print(f"{'-' * width}{RESET}")
+
+
+def dim(text):
+    return f"{DIM}{text}{RESET}"
+
+
+def info(text):
+    return f"{CYAN}{text}{RESET}"
+
+
+def success(text):
+    return f"{GREEN}{text}{RESET}"
+
+
+def warn(text):
+    return f"{YELLOW}{text}{RESET}"
+
+
+def error(text):
+    return f"{RED}{text}{RESET}"
+
+
+def file_age(path):
+    """Return human-readable age of a file."""
+    if not path.exists():
+        return "missing"
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    delta = datetime.now() - mtime
+    if delta.days > 365:
+        return f"{delta.days // 365}y ago"
+    elif delta.days > 30:
+        return f"{delta.days // 30}mo ago"
+    elif delta.days > 0:
+        return f"{delta.days}d ago"
+    elif delta.seconds > 3600:
+        return f"{delta.seconds // 3600}h ago"
+    elif delta.seconds > 60:
+        return f"{delta.seconds // 60}m ago"
+    else:
+        return "just now"
+
+
+def file_size(path):
+    """Return human-readable file size."""
+    if not path.exists():
+        return "—"
+    size = path.stat().st_size
+    if size < 1024:
+        return f"{size}B"
+    elif size < 1024 * 1024:
+        return f"{size / 1024:.1f}K"
+    else:
+        return f"{size / (1024 * 1024):.1f}M"
+
+
+def read_frontmatter(path):
+    """Read YAML-like frontmatter from a markdown file."""
+    try:
+        text = path.read_text()
+    except Exception:
+        return {}
+    fm = {}
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end > 0:
+            block = text[3:end].strip()
+            for line in block.split("\n"):
+                if ":" in line:
+                    key, _, val = line.partition(":")
+                    fm[key.strip()] = val.strip()
+    return fm
+
+
+def pause():
+    """Wait for user to press Enter."""
+    input(f"\n{DIM}Press Enter to continue...{RESET}")
+
+
+def prompt_choice(message, valid=None):
+    """Get user input with a prompt."""
+    try:
+        choice = input(f"\n{message}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "q"
+    return choice
+
+
+# ============================================================================
+# DOMAIN: CLAUDE.MD FILES
+# ============================================================================
+
+def find_claude_md_files():
+    """Find all CLAUDE.md files (project root, nested, user-level)."""
+    files = []
+    project_root = get_project_root()
+
+    # Project root
+    root_md = project_root / "CLAUDE.md"
+    if root_md.exists():
+        files.append(("Project root", root_md))
+
+    # Nested CLAUDE.md files
+    for md in sorted(project_root.rglob("CLAUDE.md")):
+        if md == root_md:
+            continue
+        if ".git" in md.parts or "node_modules" in md.parts:
+            continue
+        rel = md.relative_to(project_root)
+        files.append((str(rel.parent), md))
+
+    # User-level CLAUDE.md
+    user_md = CLAUDE_HOME / "CLAUDE.md"
+    if user_md.exists():
+        files.append(("User (~/.claude/)", user_md))
+
+    return files
+
+
+def view_claude_md():
+    """Browse and view CLAUDE.md files."""
+    files = find_claude_md_files()
+    if not files:
+        print(f"\n  {warn('No CLAUDE.md files found.')}")
+        pause()
+        return
+
+    while True:
+        header("CLAUDE.MD FILES")
+        print()
+        for i, (location, path) in enumerate(files, 1):
+            sz = file_size(path)
+            age = file_age(path)
+            print(f"  {i:>2}. {location:<35} {dim(f'{sz:>6}  {age}')}")
+
+        print(f"\n   b. Back")
+        print(f"   q. Quit")
+
+        choice = prompt_choice("File number, 'b' for back, or 'q' to quit: ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(files):
+                view_file(files[idx][1], files[idx][0])
+            else:
+                print(f"  {error('Invalid choice.')}")
+        except ValueError:
+            print(f"  {error('Invalid choice.')}")
+
+
+# ============================================================================
+# DOMAIN: MEMORY FILES
+# ============================================================================
+
+def list_memory_files():
+    """List all memory files across all matching project memory dirs."""
+    dirs = get_memory_dirs()
+    primary = get_memory_dir()
+
+    if not dirs:
+        return [], primary
+
+    seen_names = set()
+    files = []
+    # Scan all dirs, preferring newer files when names collide
+    for mem_dir in dirs:
+        if not mem_dir.exists():
+            continue
+        for f in sorted(mem_dir.iterdir()):
+            if f.name == "MEMORY.md":
+                continue
+            if f.suffix == ".md":
+                if f.name in seen_names:
+                    continue
+                seen_names.add(f.name)
+                fm = read_frontmatter(f)
+                files.append({
+                    "path": f,
+                    "name": fm.get("name", f.stem),
+                    "type": fm.get("type", "unknown"),
+                    "description": fm.get("description", ""),
+                })
+
+    return files, primary
+
+
+def view_memory():
+    """Browse and manage memory files."""
+    files, mem_dir = list_memory_files()
+
+    while True:
+        header("PROJECT MEMORY")
+        print(f"\n  Directory: {dim(str(mem_dir))}")
+
+        # Show MEMORY.md index
+        memory_index = mem_dir / "MEMORY.md"
+        if memory_index.exists():
+            print(f"  Index:     {success('MEMORY.md')} ({file_size(memory_index)}, {file_age(memory_index)})")
+
+        if not files:
+            print(f"\n  {warn('No memory files found.')}")
+            pause()
+            return
+
+        # Group by type
+        types = {}
+        for f in files:
+            t = f["type"]
+            types.setdefault(t, []).append(f)
+
+        type_order = ["project", "feedback", "user", "reference", "unknown"]
+        idx = 1
+        index_map = {}
+
+        for t in type_order:
+            if t not in types:
+                continue
+            print(f"\n  {BOLD}{t.upper()}{RESET}")
+            for f in types[t]:
+                age = file_age(f["path"])
+                sz = file_size(f["path"])
+                desc = f["description"][:45] + "..." if len(f["description"]) > 48 else f["description"]
+                print(f"  {idx:>3}. {f['name']:<30} {dim(f'{sz:>5}  {age:>8}')}  {dim(desc)}")
+                index_map[idx] = f
+                idx += 1
+
+        print(f"\n    i. View MEMORY.md index")
+        print(f"    b. Back")
+        print(f"    q. Quit")
+
+        choice = prompt_choice(f"File number (1-{idx-1}), 'i', 'b', or 'q': ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        if choice == "i":
+            view_file(memory_index, "MEMORY.md Index")
+            continue
+        try:
+            num = int(choice)
+            if num in index_map:
+                f = index_map[num]
+                view_file(f["path"], f["name"])
+            else:
+                print(f"  {error('Invalid choice.')}")
+        except ValueError:
+            print(f"  {error('Invalid choice.')}")
+
+
+# ============================================================================
+# DOMAIN: SETTINGS
+# ============================================================================
+
+def view_settings():
+    """View and explore settings files."""
+    while True:
+        header("SETTINGS & PERMISSIONS")
+
+        settings = {}
+        if CLAUDE_SETTINGS.exists():
+            try:
+                settings = json.loads(CLAUDE_SETTINGS.read_text())
+            except Exception as e:
+                print(f"\n  {error(f'Error reading settings: {e}')}")
+                pause()
+                return
+
+        # Permissions
+        perms = settings.get("permissions", {})
+        allow = perms.get("allow", [])
+        deny = perms.get("deny", [])
+        ask = perms.get("ask", [])
+        mode = perms.get("defaultMode", "default")
+
+        print(f"\n  {BOLD}Permissions{RESET}")
+        print(f"    Mode:  {info(mode)}")
+        print(f"    Allow: {len(allow)} rules")
+        print(f"    Deny:  {len(deny)} rules")
+        print(f"    Ask:   {len(ask)} rules")
+
+        # Hooks
+        hooks = settings.get("hooks", {})
+        hook_count = sum(len(v) for v in hooks.values())
+        print(f"\n  {BOLD}Hooks{RESET}")
+        print(f"    {hook_count} hook(s) across {len(hooks)} event(s)")
+
+        # Other settings
+        other_keys = [k for k in settings if k not in ("permissions", "hooks")]
+        if other_keys:
+            print(f"\n  {BOLD}Other Settings{RESET}")
+            for k in other_keys:
+                v = settings[k]
+                if isinstance(v, dict):
+                    print(f"    {k}: {dim(json.dumps(v, indent=None)[:60])}")
+                else:
+                    print(f"    {k}: {info(str(v))}")
+
+        print(f"\n  1. View allow rules")
+        print(f"  2. View deny rules")
+        print(f"  3. View ask rules")
+        print(f"  4. View hooks detail")
+        print(f"  5. View raw JSON")
+        print(f"\n  b. Back")
+        print(f"  q. Quit")
+
+        choice = prompt_choice("Choice (1-5), 'b', or 'q': ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        if choice == "1":
+            subheader("ALLOW RULES")
+            if allow:
+                for i, rule in enumerate(allow, 1):
+                    print(f"  {i:>3}. {rule}")
+            else:
+                print(f"  {dim('(none)')}")
+            pause()
+        elif choice == "2":
+            subheader("DENY RULES")
+            if deny:
+                for i, rule in enumerate(deny, 1):
+                    print(f"  {i:>3}. {rule}")
+            else:
+                print(f"  {dim('(none)')}")
+            pause()
+        elif choice == "3":
+            subheader("ASK RULES")
+            if ask:
+                for i, rule in enumerate(ask, 1):
+                    print(f"  {i:>3}. {rule}")
+            else:
+                print(f"  {dim('(none)')}")
+            pause()
+        elif choice == "4":
+            view_hooks_detail(hooks)
+        elif choice == "5":
+            subheader("RAW SETTINGS JSON")
+            print(json.dumps(settings, indent=2))
+            pause()
+
+
+def view_hooks_detail(hooks):
+    """Display hooks configuration in detail."""
+    subheader("HOOKS DETAIL")
+    if not hooks:
+        print(f"  {dim('No hooks configured.')}")
+        pause()
+        return
+
+    for event, hook_list in hooks.items():
+        print(f"\n  {BOLD}{event}{RESET}")
+        for i, hook_entry in enumerate(hook_list, 1):
+            matcher = hook_entry.get("matcher", "(all)")
+            inner_hooks = hook_entry.get("hooks", [])
+            print(f"    {i}. Matcher: {info(matcher)}")
+            for h in inner_hooks:
+                htype = h.get("type", "?")
+                cmd = h.get("command", "?")
+                print(f"       Type: {htype}")
+                print(f"       Cmd:  {dim(cmd)}")
+    pause()
+
+
+# ============================================================================
+# DOMAIN: SLASH COMMANDS
+# ============================================================================
+
+def list_slash_commands():
+    """Find all slash command files."""
+    commands = []
+
+    # User-level commands
+    if CLAUDE_COMMANDS_USER.exists():
+        for f in sorted(CLAUDE_COMMANDS_USER.iterdir()):
+            if f.suffix == ".md":
+                commands.append(("user", f))
+
+    # Project-level commands
+    proj_cmds = get_project_commands_dir()
+    if proj_cmds.exists():
+        for f in sorted(proj_cmds.iterdir()):
+            if f.suffix == ".md":
+                commands.append(("project", f))
+
+    return commands
+
+
+def view_commands():
+    """Browse slash commands."""
+    commands = list_slash_commands()
+
+    while True:
+        header("SLASH COMMANDS")
+
+        if not commands:
+            print(f"\n  {warn('No custom slash commands found.')}")
+            print(f"\n  User dir:    {dim(str(CLAUDE_COMMANDS_USER))}")
+            print(f"  Project dir: {dim(str(get_project_commands_dir()))}")
+            pause()
+            return
+
+        for i, (scope, path) in enumerate(commands, 1):
+            name = path.stem
+            sz = file_size(path)
+            age = file_age(path)
+            scope_label = info(f"[{scope}]")
+            print(f"\n  {i:>2}. /{name:<20} {scope_label}  {dim(f'{sz:>5}  {age}')}")
+
+        print(f"\n   b. Back")
+        print(f"   q. Quit")
+
+        choice = prompt_choice("Command number, 'b', or 'q': ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(commands):
+                view_file(commands[idx][1], f"/{commands[idx][1].stem}")
+            else:
+                print(f"  {error('Invalid choice.')}")
+        except ValueError:
+            print(f"  {error('Invalid choice.')}")
+
+
+# ============================================================================
+# DOMAIN: MCP PLUGINS
+# ============================================================================
+
+def list_plugins():
+    """List installed and available MCP plugins."""
+    plugins = []
+
+    # Check marketplace plugins
+    marketplace_dir = CLAUDE_PLUGINS / "marketplaces"
+    if marketplace_dir.exists():
+        for mkt in sorted(marketplace_dir.iterdir()):
+            if not mkt.is_dir():
+                continue
+            ext_dir = mkt / "external_plugins"
+            if ext_dir.exists():
+                for plugin_dir in sorted(ext_dir.iterdir()):
+                    if plugin_dir.is_dir():
+                        mcp_file = plugin_dir / ".mcp.json"
+                        has_config = mcp_file.exists()
+                        plugins.append({
+                            "name": plugin_dir.name,
+                            "marketplace": mkt.name,
+                            "path": plugin_dir,
+                            "configured": has_config,
+                        })
+
+    return plugins
+
+
+def view_plugins():
+    """Browse MCP plugins."""
+    while True:
+        header("MCP PLUGINS")
+        plugins = list_plugins()
+
+        # Check for blocklist
+        blocklist_file = CLAUDE_PLUGINS / "blocklist.json"
+        blocklist = []
+        if blocklist_file.exists():
+            try:
+                blocklist = json.loads(blocklist_file.read_text())
+            except Exception:
+                pass
+
+        if not plugins:
+            print(f"\n  {warn('No plugins found.')}")
+            pause()
+            return
+
+        for i, p in enumerate(plugins, 1):
+            status = success("configured") if p["configured"] else dim("available")
+            blocked = error(" [BLOCKED]") if any(p["name"] in b for b in blocklist) else ""
+            print(f"  {i:>2}. {p['name']:<25} {status}{blocked}  {dim(p['marketplace'])}")
+
+        if blocklist:
+            print(f"\n  {dim(f'Blocklist: {len(blocklist)} entries')}")
+
+        print(f"\n   b. Back")
+        print(f"   q. Quit")
+
+        choice = prompt_choice("Plugin number, 'b', or 'q': ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(plugins):
+                view_plugin_detail(plugins[idx])
+            else:
+                print(f"  {error('Invalid choice.')}")
+        except ValueError:
+            print(f"  {error('Invalid choice.')}")
+
+
+def view_plugin_detail(plugin):
+    """Show detail for a single plugin."""
+    subheader(f"PLUGIN: {plugin['name']}")
+    print(f"  Marketplace: {plugin['marketplace']}")
+    print(f"  Path: {dim(str(plugin['path']))}")
+
+    mcp_file = plugin["path"] / ".mcp.json"
+    if mcp_file.exists():
+        try:
+            config = json.loads(mcp_file.read_text())
+            print(f"\n  {BOLD}MCP Configuration:{RESET}")
+            print(json.dumps(config, indent=2))
+        except Exception as e:
+            print(f"  {error(f'Error reading config: {e}')}")
+    else:
+        print(f"\n  {dim('No .mcp.json configuration file.')}")
+
+    # Check for README
+    readme = plugin["path"] / "README.md"
+    if readme.exists():
+        print(f"\n  {BOLD}README (first 20 lines):{RESET}")
+        lines = readme.read_text().split("\n")[:20]
+        for line in lines:
+            print(f"  {line}")
+
+    pause()
+
+
+# ============================================================================
+# DOMAIN: PLANS
+# ============================================================================
+
+def list_plans():
+    """List plan files."""
+    plans = []
+    if CLAUDE_PLANS.exists():
+        for f in sorted(CLAUDE_PLANS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.suffix == ".md":
+                plans.append(f)
+    return plans
+
+
+def view_plans():
+    """Browse plan files."""
+    while True:
+        plans = list_plans()
+        header("PLANS")
+
+        if not plans:
+            print(f"\n  {warn('No plan files found.')}")
+            pause()
+            return
+
+        for i, p in enumerate(plans, 1):
+            age = file_age(p)
+            sz = file_size(p)
+            # Show first non-empty line as preview
+            preview = ""
+            try:
+                for line in p.read_text().split("\n"):
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("---"):
+                        preview = line[:50]
+                        break
+            except Exception:
+                pass
+            print(f"  {i:>3}. {p.stem:<35} {dim(f'{sz:>5}  {age}')}")
+            if preview:
+                print(f"       {dim(preview)}")
+
+        print(f"\n    b. Back")
+        print(f"    q. Quit")
+
+        choice = prompt_choice(f"Plan number (1-{len(plans)}), 'b', or 'q': ")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "b":
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(plans):
+                view_file(plans[idx], plans[idx].stem)
+            else:
+                print(f"  {error('Invalid choice.')}")
+        except ValueError:
+            print(f"  {error('Invalid choice.')}")
+
+
+# ============================================================================
+# DOMAIN: CONTEXT SUMMARY
+# ============================================================================
+
+def view_context_summary():
+    """Show an overview of all context that Claude sees for this project."""
+    header("CONTEXT SUMMARY")
+
+    project_root = get_project_root()
+    print(f"\n  {BOLD}Project{RESET}")
+    print(f"    Root: {info(str(project_root))}")
+
+    # CLAUDE.md
+    claude_files = find_claude_md_files()
+    print(f"\n  {BOLD}CLAUDE.md Files{RESET}")
+    if claude_files:
+        for loc, path in claude_files:
+            print(f"    {loc:<30} {file_size(path):>6}  {dim(file_age(path))}")
+    else:
+        print(f"    {dim('(none)')}")
+
+    # Memory
+    files, mem_dir = list_memory_files()
+    print(f"\n  {BOLD}Memory{RESET}")
+    print(f"    Directory: {dim(str(mem_dir))}")
+    if files:
+        types = {}
+        for f in files:
+            types.setdefault(f["type"], []).append(f)
+        for t, items in types.items():
+            print(f"    {t}: {len(items)} file(s)")
+    else:
+        print(f"    {dim('(none)')}")
+
+    # Memory index
+    memory_index = mem_dir / "MEMORY.md"
+    if memory_index.exists():
+        print(f"    MEMORY.md: {file_size(memory_index)} {dim(file_age(memory_index))}")
+
+    # Settings
+    print(f"\n  {BOLD}Settings{RESET}")
+    if CLAUDE_SETTINGS.exists():
+        settings = {}
+        try:
+            settings = json.loads(CLAUDE_SETTINGS.read_text())
+        except Exception:
+            pass
+        perms = settings.get("permissions", {})
+        hooks = settings.get("hooks", {})
+        print(f"    Allow rules: {len(perms.get('allow', []))}")
+        print(f"    Hooks: {sum(len(v) for v in hooks.values())} across {len(hooks)} event(s)")
+    else:
+        print(f"    {dim('(no settings.json)')}")
+
+    # Commands
+    commands = list_slash_commands()
+    print(f"\n  {BOLD}Slash Commands{RESET}")
+    if commands:
+        for scope, path in commands:
+            print(f"    /{path.stem:<20} [{scope}]")
+    else:
+        print(f"    {dim('(none)')}")
+
+    # Plugins
+    plugins = list_plugins()
+    configured = sum(1 for p in plugins if p["configured"])
+    print(f"\n  {BOLD}MCP Plugins{RESET}")
+    print(f"    Available: {len(plugins)}  Configured: {configured}")
+
+    # Plans
+    plans = list_plans()
+    print(f"\n  {BOLD}Plans{RESET}")
+    print(f"    {len(plans)} plan file(s)")
+
+    pause()
+
+
+# ============================================================================
+# FILE VIEWER
+# ============================================================================
+
+def view_file(path, title=""):
+    """Display file contents with pagination."""
+    subheader(f"FILE: {title or path.name}")
+    print(f"  Path: {dim(str(path))}")
+    print(f"  Size: {file_size(path)}  Modified: {file_age(path)}")
+    print()
+
+    try:
+        content = path.read_text()
+    except Exception as e:
+        print(f"  {error(f'Error reading file: {e}')}")
+        pause()
+        return
+
+    lines = content.split("\n")
+    page_size = 40
+    offset = 0
+
+    while True:
+        page = lines[offset:offset + page_size]
+        for i, line in enumerate(page, offset + 1):
+            print(f"  {dim(f'{i:>4}')}  {line}")
+
+        total = len(lines)
+        showing_to = min(offset + page_size, total)
+        print(f"\n  {dim(f'Lines {offset + 1}-{showing_to} of {total}')}")
+
+        if showing_to >= total and offset == 0:
+            # Whole file shown
+            pause()
+            return
+
+        options = []
+        if showing_to < total:
+            options.append("n=next")
+        if offset > 0:
+            options.append("p=prev")
+        options.append("t=top")
+        options.append("b=back")
+
+        choice = prompt_choice(f"[{', '.join(options)}]: ")
+        if choice in ("b", "q"):
+            return
+        elif choice == "n" and showing_to < total:
+            offset += page_size
+        elif choice == "p" and offset > 0:
+            offset = max(0, offset - page_size)
+        elif choice == "t":
+            offset = 0
+        else:
+            return
+
+
+# ============================================================================
+# MAIN MENU
+# ============================================================================
+
+def main_menu():
+    """Display the top-level explorer menu."""
+    header("CLAUDE EXPLORER")
+    print(f"\n  Project: {info(str(get_project_root()))}")
+    print(f"\n  {BOLD}Context Objects:{RESET}")
+    print()
+    print(f"  1. CLAUDE.md Files        Project instructions & conventions")
+    print(f"  2. Memory                 Project memory (cross-conversation)")
+    print(f"  3. Settings & Permissions Allow/deny rules, mode, misc config")
+    print(f"  4. Hooks                  Pre/post tool-use hooks")
+    print(f"  5. Slash Commands         Custom /commands")
+    print(f"  6. MCP Plugins            Model Context Protocol integrations")
+    print(f"  7. Plans                  Implementation plans")
+    print()
+    print(f"  {BOLD}Overview:{RESET}")
+    print(f"  0. Context Summary        Full snapshot of what Claude sees")
+    print()
+    print(f"  q. Quit")
+
+
+VERSION = "0.1.0"
+
+DISCLAIMER = f"""{BOLD}{YELLOW}
+DISCLAIMER: This software is provided "as is", without warranty of any kind.
+Not affiliated with or endorsed by Anthropic, PBC. Read-only access to local
+Claude Code config files. Use at your own risk. No guarantee of correctness,
+completeness, or fitness for any particular purpose. See MIT License in source.
+{RESET}"""
+
+
+def main():
+    """Main application loop."""
+    print(f"\n{BOLD}{'=' * 70}")
+    print(f"CLAUDE EXPLORER (ce) v{VERSION}")
+    print(f"{'=' * 70}{RESET}")
+    print(f"\nInteractive navigator for Claude Code context objects.")
+    print(DISCLAIMER)
+
+    while True:
+        main_menu()
+        choice = prompt_choice("Choose (0-7) or 'q' to quit: ")
+
+        if choice == "q":
+            print("\nGoodbye!")
+            break
+        elif choice == "0":
+            view_context_summary()
+        elif choice == "1":
+            view_claude_md()
+        elif choice == "2":
+            view_memory()
+        elif choice == "3":
+            view_settings()
+        elif choice == "4":
+            # Direct to hooks within settings
+            if CLAUDE_SETTINGS.exists():
+                try:
+                    settings = json.loads(CLAUDE_SETTINGS.read_text())
+                    hooks = settings.get("hooks", {})
+                    view_hooks_detail(hooks)
+                except Exception as e:
+                    print(f"  {error(f'Error: {e}')}")
+                    pause()
+            else:
+                print(f"  {warn('No settings.json found.')}")
+                pause()
+        elif choice == "5":
+            view_commands()
+        elif choice == "6":
+            view_plugins()
+        elif choice == "7":
+            view_plans()
+        else:
+            print(f"  {error(f'Invalid choice: {choice}')}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted. Goodbye!")
+        sys.exit(0)
