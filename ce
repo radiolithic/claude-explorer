@@ -907,9 +907,223 @@ Claude Code config files. Use at your own risk. No guarantee of correctness,
 completeness, or fitness for any particular purpose. See MIT License in source.
 {RESET}"""
 
+# The slash command definition, embedded so `ce install` is self-contained.
+SLASH_COMMAND = r'''You are the Claude Explorer — an interactive navigator for Claude Code context objects. Present a conversational menu system so the user can browse their Claude context without leaving the conversation.
+
+## Behavior
+
+1. If "$ARGUMENTS" is empty, show the **Main Menu** below.
+2. If "$ARGUMENTS" is a number (0-7), jump directly to that section.
+3. If "$ARGUMENTS" is a keyword (e.g. "memory", "settings"), jump to the matching section.
+4. After showing any section, ask "Pick a number to view, or **b** for back, **q** to close."
+5. When the user picks an item, use Read/Glob/Bash tools to fetch and display the content.
+6. Keep the menu loop going until the user says **q**, "done", or changes topic.
+
+## Main Menu
+
+Present this exactly:
+
+```
+CLAUDE EXPLORER
+
+  1. CLAUDE.md Files        Project instructions & conventions
+  2. Memory                 Project memory (cross-conversation)
+  3. Settings & Permissions Allow/deny rules, mode, misc config
+  4. Hooks                  Pre/post tool-use hooks
+  5. Slash Commands         Custom /commands
+  6. MCP Plugins            Model Context Protocol integrations
+  7. Plans                  Implementation plans
+
+  0. Context Summary        Full snapshot of what Claude sees
+
+  q. Close
+```
+
+## Section Details
+
+### 0. Context Summary
+Run `ce` non-interactively to get the summary: `echo "0" | ce 2>&1 | head -80`
+Display the output, stripping ANSI codes if needed.
+
+### 1. CLAUDE.md Files
+- Find all CLAUDE.md files: project root, nested dirs (skip .git/node_modules), and ~/.claude/CLAUDE.md
+- List them with size and age
+- When the user picks one, Read it and display (paginate if long — show first 60 lines, offer to continue)
+
+### 2. Memory
+- The memory directory is at `~/.claude/projects/` under a slug derived from the project path (/ replaced with -)
+- Multiple slug variants may exist (e.g. scoring_app vs scoring-app) — check all matching dirs
+- List all .md files (except MEMORY.md) grouped by frontmatter `type:` field (project, feedback, user, reference)
+- Show: number, name from frontmatter, size, age, description truncated to ~50 chars
+- Offer **i** to view the MEMORY.md index
+- When the user picks one, Read and display it
+
+### 3. Settings & Permissions
+- Read ~/.claude/settings.json
+- Show summary: permission mode, count of allow/deny/ask rules, hook count, other keys
+- Sub-menu: 1=allow rules, 2=deny rules, 3=ask rules, 4=hooks detail, 5=raw JSON
+
+### 4. Hooks
+- Read the "hooks" key from ~/.claude/settings.json
+- For each event type, show matchers and commands
+
+### 5. Slash Commands
+- Glob for ~/.claude/commands/*.md (user-level) and .claude/commands/*.md (project-level)
+- List with scope tag [user] or [project]
+- When picked, Read and display
+
+### 6. MCP Plugins
+- List dirs under ~/.claude/plugins/marketplaces/*/external_plugins/
+- Show name, whether .mcp.json exists (configured vs available)
+- Check ~/.claude/plugins/blocklist.json for blocked entries
+- When picked, Read the .mcp.json and show config
+
+### 7. Plans
+- List ~/.claude/plans/*.md sorted by modification time (newest first)
+- Show name, size, age, and first non-header line as preview
+- When picked, Read and display (paginate if long)
+
+## Formatting Rules
+
+- Use markdown code blocks for structured output (menus, file listings)
+- Use tables when listing items with multiple columns
+- Keep responses concise — don't over-explain
+- When displaying file content, use code blocks with appropriate language hints
+- Truncate long files at ~60 lines and offer to show more
+'''
+
+
+# ============================================================================
+# INSTALL / UNINSTALL
+# ============================================================================
+
+def cmd_install(scope="user"):
+    """Install the /ce slash command for Claude Code.
+
+    Args:
+        scope: "user" installs to ~/.claude/commands/ (global),
+               "project" installs to .claude/commands/ in current project.
+    """
+    if scope == "project":
+        target_dir = get_project_commands_dir()
+        label = f"project ({get_project_root()})"
+    else:
+        target_dir = CLAUDE_COMMANDS_USER
+        label = "user (global)"
+
+    target = target_dir / "ce.md"
+
+    if target.exists():
+        print(f"\n  {warn('/ce slash command is already installed')} [{label}]")
+        print(f"  {dim(str(target))}")
+        return
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target.write_text(SLASH_COMMAND)
+    print(f"\n  {success('Installed /ce slash command')} [{label}]")
+    print(f"  {dim(str(target))}")
+
+
+def cmd_uninstall(scope="user"):
+    """Remove the /ce slash command.
+
+    Args:
+        scope: "user" removes from ~/.claude/commands/,
+               "project" removes from .claude/commands/ in current project,
+               "all" removes from both.
+    """
+    removed = False
+
+    targets = []
+    if scope in ("user", "all"):
+        targets.append(("user (global)", CLAUDE_COMMANDS_USER / "ce.md"))
+    if scope in ("project", "all"):
+        targets.append((f"project ({get_project_root()})", get_project_commands_dir() / "ce.md"))
+
+    for label, target in targets:
+        if target.exists():
+            target.unlink()
+            print(f"\n  {success('Removed /ce slash command')} [{label}]")
+            print(f"  {dim(str(target))}")
+            removed = True
+
+    if not removed:
+        print(f"\n  {warn('/ce slash command is not installed.')}")
+
+
+def cmd_status():
+    """Show installation status of the /ce slash command."""
+    print(f"\n  {BOLD}Claude Explorer v{VERSION} — Install Status{RESET}\n")
+
+    # Script
+    script_path = Path(__file__).resolve()
+    print(f"  Script:  {success(str(script_path))}")
+
+    # User-level slash command
+    user_cmd = CLAUDE_COMMANDS_USER / "ce.md"
+    if user_cmd.exists():
+        print(f"  User:    {success('installed')}  {dim(str(user_cmd))}")
+    else:
+        print(f"  User:    {dim('not installed')}  (ce install)")
+
+    # Project-level slash command
+    proj_cmd = get_project_commands_dir() / "ce.md"
+    if proj_cmd.exists():
+        print(f"  Project: {success('installed')}  {dim(str(proj_cmd))}")
+    else:
+        print(f"  Project: {dim('not installed')}  (ce install --project)")
+
+    print()
+
+
+def handle_subcommand(args):
+    """Handle install/uninstall/status sub-commands. Returns True if handled."""
+    if not args:
+        return False
+
+    cmd = args[0].lower()
+
+    if cmd == "install":
+        scope = "project" if "--project" in args else "user"
+        cmd_install(scope)
+        return True
+    elif cmd == "uninstall":
+        if "--all" in args:
+            scope = "all"
+        elif "--project" in args:
+            scope = "project"
+        else:
+            scope = "user"
+        cmd_uninstall(scope)
+        return True
+    elif cmd == "status":
+        cmd_status()
+        return True
+    elif cmd in ("--help", "-h", "help"):
+        print(f"""
+  {BOLD}Claude Explorer (ce) v{VERSION}{RESET}
+
+  {BOLD}Usage:{RESET}
+    ce                      Interactive explorer
+    ce install              Install /ce slash command (user-level, global)
+    ce install --project    Install /ce slash command (project-level only)
+    ce uninstall            Remove /ce slash command (user-level)
+    ce uninstall --project  Remove /ce slash command (project-level)
+    ce uninstall --all      Remove /ce slash command (both)
+    ce status               Show installation status
+    ce help                 Show this help
+""")
+        return True
+
+    return False
+
 
 def main():
     """Main application loop."""
+    # Handle sub-commands first
+    if handle_subcommand(sys.argv[1:]):
+        return
+
     print(f"\n{BOLD}{'=' * 70}")
     print(f"CLAUDE EXPLORER (ce) v{VERSION}")
     print(f"{'=' * 70}{RESET}")
